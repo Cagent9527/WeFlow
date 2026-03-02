@@ -79,9 +79,27 @@ interface TaskProgress {
   current: number
   total: number
   currentName: string
+  phase: ExportProgress['phase'] | ''
   phaseLabel: string
   phaseProgress: number
   phaseTotal: number
+}
+
+type TaskPerfStage = 'collect' | 'build' | 'write' | 'other'
+
+interface TaskSessionPerformance {
+  sessionId: string
+  sessionName: string
+  startedAt: number
+  finishedAt?: number
+  elapsedMs: number
+  lastPhase?: ExportProgress['phase']
+  lastPhaseStartedAt?: number
+}
+
+interface TaskPerformance {
+  stages: Record<TaskPerfStage, number>
+  sessions: Record<string, TaskSessionPerformance>
 }
 
 interface ExportTaskPayload {
@@ -110,6 +128,7 @@ interface ExportTask {
   error?: string
   payload: ExportTaskPayload
   progress: TaskProgress
+  performance?: TaskPerformance
 }
 
 interface ExportDialogState {
@@ -170,10 +189,164 @@ const createEmptyProgress = (): TaskProgress => ({
   current: 0,
   total: 0,
   currentName: '',
+  phase: '',
   phaseLabel: '',
   phaseProgress: 0,
   phaseTotal: 0
 })
+
+const createEmptyTaskPerformance = (): TaskPerformance => ({
+  stages: {
+    collect: 0,
+    build: 0,
+    write: 0,
+    other: 0
+  },
+  sessions: {}
+})
+
+const isTextBatchTask = (task: ExportTask): boolean => (
+  task.payload.scope === 'content' && task.payload.contentType === 'text'
+)
+
+const resolvePerfStageByPhase = (phase?: ExportProgress['phase']): TaskPerfStage => {
+  if (phase === 'preparing') return 'collect'
+  if (phase === 'writing') return 'write'
+  if (phase === 'exporting' || phase === 'exporting-media' || phase === 'exporting-voice') return 'build'
+  return 'other'
+}
+
+const cloneTaskPerformance = (performance?: TaskPerformance): TaskPerformance => ({
+  stages: {
+    collect: performance?.stages.collect || 0,
+    build: performance?.stages.build || 0,
+    write: performance?.stages.write || 0,
+    other: performance?.stages.other || 0
+  },
+  sessions: Object.fromEntries(
+    Object.entries(performance?.sessions || {}).map(([sessionId, session]) => [sessionId, { ...session }])
+  )
+})
+
+const resolveTaskSessionName = (task: ExportTask, sessionId: string, fallback?: string): string => {
+  const idx = task.payload.sessionIds.indexOf(sessionId)
+  if (idx >= 0) {
+    return task.payload.sessionNames[idx] || fallback || sessionId
+  }
+  return fallback || sessionId
+}
+
+const applyProgressToTaskPerformance = (
+  task: ExportTask,
+  payload: ExportProgress,
+  now: number
+): TaskPerformance | undefined => {
+  if (!isTextBatchTask(task)) return task.performance
+  const sessionId = String(payload.currentSessionId || '').trim()
+  if (!sessionId) return task.performance || createEmptyTaskPerformance()
+
+  const performance = cloneTaskPerformance(task.performance)
+  const sessionName = resolveTaskSessionName(task, sessionId, payload.currentSession || sessionId)
+  const existing = performance.sessions[sessionId]
+  const session: TaskSessionPerformance = existing
+    ? { ...existing, sessionName: existing.sessionName || sessionName }
+    : {
+      sessionId,
+      sessionName,
+      startedAt: now,
+      elapsedMs: 0
+    }
+
+  if (!session.finishedAt && session.lastPhase && typeof session.lastPhaseStartedAt === 'number') {
+    const delta = Math.max(0, now - session.lastPhaseStartedAt)
+    performance.stages[resolvePerfStageByPhase(session.lastPhase)] += delta
+  }
+
+  session.elapsedMs = Math.max(session.elapsedMs, now - session.startedAt)
+
+  if (payload.phase === 'complete') {
+    session.finishedAt = now
+    session.lastPhase = undefined
+    session.lastPhaseStartedAt = undefined
+  } else {
+    session.lastPhase = payload.phase
+    session.lastPhaseStartedAt = now
+  }
+
+  performance.sessions[sessionId] = session
+  return performance
+}
+
+const finalizeTaskPerformance = (task: ExportTask, now: number): TaskPerformance | undefined => {
+  if (!isTextBatchTask(task) || !task.performance) return task.performance
+  const performance = cloneTaskPerformance(task.performance)
+  for (const session of Object.values(performance.sessions)) {
+    if (session.finishedAt) continue
+    if (session.lastPhase && typeof session.lastPhaseStartedAt === 'number') {
+      const delta = Math.max(0, now - session.lastPhaseStartedAt)
+      performance.stages[resolvePerfStageByPhase(session.lastPhase)] += delta
+    }
+    session.elapsedMs = Math.max(session.elapsedMs, now - session.startedAt)
+    session.finishedAt = now
+    session.lastPhase = undefined
+    session.lastPhaseStartedAt = undefined
+  }
+  return performance
+}
+
+const getTaskPerformanceStageTotals = (
+  performance: TaskPerformance | undefined,
+  now: number
+): Record<TaskPerfStage, number> => {
+  const totals: Record<TaskPerfStage, number> = {
+    collect: performance?.stages.collect || 0,
+    build: performance?.stages.build || 0,
+    write: performance?.stages.write || 0,
+    other: performance?.stages.other || 0
+  }
+  if (!performance) return totals
+  for (const session of Object.values(performance.sessions)) {
+    if (session.finishedAt) continue
+    if (!session.lastPhase || typeof session.lastPhaseStartedAt !== 'number') continue
+    const delta = Math.max(0, now - session.lastPhaseStartedAt)
+    totals[resolvePerfStageByPhase(session.lastPhase)] += delta
+  }
+  return totals
+}
+
+const getTaskPerformanceTopSessions = (
+  performance: TaskPerformance | undefined,
+  now: number,
+  limit = 5
+): Array<TaskSessionPerformance & { liveElapsedMs: number }> => {
+  if (!performance) return []
+  return Object.values(performance.sessions)
+    .map((session) => {
+      const liveElapsedMs = session.finishedAt
+        ? session.elapsedMs
+        : Math.max(session.elapsedMs, now - session.startedAt)
+      return {
+        ...session,
+        liveElapsedMs
+      }
+    })
+    .sort((a, b) => b.liveElapsedMs - a.liveElapsedMs)
+    .slice(0, limit)
+}
+
+const formatDurationMs = (ms: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours}小时${minutes}分${seconds}秒`
+  }
+  if (minutes > 0) {
+    return `${minutes}分${seconds}秒`
+  }
+  return `${seconds}秒`
+}
 
 const getTaskStatusLabel = (task: ExportTask): string => {
   if (task.status === 'queued') return '排队中'
@@ -570,6 +743,7 @@ function ExportPage() {
   const [isSnsStatsLoading, setIsSnsStatsLoading] = useState(true)
   const [isBaseConfigLoading, setIsBaseConfigLoading] = useState(true)
   const [isTaskCenterOpen, setIsTaskCenterOpen] = useState(false)
+  const [expandedPerfTaskId, setExpandedPerfTaskId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<SessionRow[]>([])
   const [sessionDataSource, setSessionDataSource] = useState<SessionDataSource>(null)
   const [sessionContactsUpdatedAt, setSessionContactsUpdatedAt] = useState<number | null>(null)
@@ -1023,6 +1197,14 @@ function ExportPage() {
   }, [tasks])
 
   useEffect(() => {
+    if (!expandedPerfTaskId) return
+    const target = tasks.find(task => task.id === expandedPerfTaskId)
+    if (!target || !isTextBatchTask(target)) {
+      setExpandedPerfTaskId(null)
+    }
+  }, [tasks, expandedPerfTaskId])
+
+  useEffect(() => {
     hasSeededSnsStatsRef.current = hasSeededSnsStats
   }, [hasSeededSnsStats])
 
@@ -1043,6 +1225,14 @@ function ExportPage() {
     const timer = setInterval(() => setNowTick(Date.now()), 60 * 1000)
     return () => clearInterval(timer)
   }, [isExportRoute])
+
+  useEffect(() => {
+    if (!isTaskCenterOpen || !expandedPerfTaskId) return
+    const target = tasks.find(task => task.id === expandedPerfTaskId)
+    if (!target || target.status !== 'running' || !isTextBatchTask(target)) return
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [isTaskCenterOpen, expandedPerfTaskId, tasks])
 
   const loadBaseConfig = useCallback(async (): Promise<boolean> => {
     setIsBaseConfigLoading(true)
@@ -1718,7 +1908,10 @@ function ExportPage() {
       controlState: undefined,
       startedAt: Date.now(),
       finishedAt: undefined,
-      error: undefined
+      error: undefined,
+      performance: isTextBatchTask(task)
+        ? (task.performance || createEmptyTaskPerformance())
+        : task.performance
     }))
 
     progressUnsubscribeRef.current?.()
@@ -1732,6 +1925,7 @@ function ExportPage() {
               current: payload.current || 0,
               total: payload.total || 0,
               currentName: '',
+              phase: 'exporting',
               phaseLabel: payload.status || '',
               phaseProgress: payload.total > 0 ? payload.current : 0,
               phaseTotal: payload.total || 0
@@ -1743,16 +1937,20 @@ function ExportPage() {
       progressUnsubscribeRef.current = window.electronAPI.export.onProgress((payload: ExportProgress) => {
         updateTask(next.id, task => {
           if (task.status !== 'running') return task
+          const now = Date.now()
+          const performance = applyProgressToTaskPerformance(task, payload, now)
           return {
             ...task,
             progress: {
               current: payload.current,
               total: payload.total,
               currentName: payload.currentSession,
+              phase: payload.phase,
               phaseLabel: payload.phaseLabel || '',
               phaseProgress: payload.phaseProgress || 0,
               phaseTotal: payload.phaseTotal || 0
-            }
+            },
+            performance
           }
         })
       })
@@ -1776,7 +1974,8 @@ function ExportPage() {
             status: 'error',
             controlState: undefined,
             finishedAt: Date.now(),
-            error: result.error || '朋友圈导出失败'
+            error: result.error || '朋友圈导出失败',
+            performance: finalizeTaskPerformance(task, Date.now())
           }))
         } else if (result.stopped) {
           updateTask(next.id, task => ({
@@ -1787,7 +1986,8 @@ function ExportPage() {
             progress: {
               ...task.progress,
               phaseLabel: '已停止'
-            }
+            },
+            performance: finalizeTaskPerformance(task, Date.now())
           }))
         } else if (result.paused) {
           updateTask(next.id, task => ({
@@ -1798,7 +1998,8 @@ function ExportPage() {
             progress: {
               ...task.progress,
               phaseLabel: '已暂停'
-            }
+            },
+            performance: finalizeTaskPerformance(task, Date.now())
           }))
         } else {
           const doneAt = Date.now()
@@ -1820,7 +2021,8 @@ function ExportPage() {
               phaseLabel: '完成',
               phaseProgress: 1,
               phaseTotal: 1
-            }
+            },
+            performance: finalizeTaskPerformance(task, doneAt)
           }))
         }
       } else {
@@ -1841,7 +2043,8 @@ function ExportPage() {
             status: 'error',
             controlState: undefined,
             finishedAt: Date.now(),
-            error: result.error || '导出失败'
+            error: result.error || '导出失败',
+            performance: finalizeTaskPerformance(task, Date.now())
           }))
         } else {
           const doneAt = Date.now()
@@ -1867,7 +2070,8 @@ function ExportPage() {
                 current: result.successCount + result.failCount,
                 total: task.progress.total || next.payload.sessionIds.length,
                 phaseLabel: '已停止'
-              }
+              },
+              performance: finalizeTaskPerformance(task, doneAt)
             }))
           } else if (result.paused) {
             const pendingSessionIds = Array.isArray(result.pendingSessionIds)
@@ -1892,7 +2096,8 @@ function ExportPage() {
                   phaseLabel: '完成',
                   phaseProgress: 1,
                   phaseTotal: 1
-                }
+                },
+                performance: finalizeTaskPerformance(task, doneAt)
               }))
             } else {
               updateTask(next.id, task => ({
@@ -1910,7 +2115,8 @@ function ExportPage() {
                   current: result.successCount + result.failCount,
                   total: task.progress.total || next.payload.sessionIds.length,
                   phaseLabel: '已暂停'
-                }
+                },
+                performance: finalizeTaskPerformance(task, doneAt)
               }))
             }
           } else {
@@ -1926,18 +2132,21 @@ function ExportPage() {
                 phaseLabel: '完成',
                 phaseProgress: 1,
                 phaseTotal: 1
-              }
+              },
+              performance: finalizeTaskPerformance(task, doneAt)
             }))
           }
         }
       }
     } catch (error) {
+      const doneAt = Date.now()
       updateTask(next.id, task => ({
         ...task,
         status: 'error',
         controlState: undefined,
-        finishedAt: Date.now(),
-        error: String(error)
+        finishedAt: doneAt,
+        error: String(error),
+        performance: finalizeTaskPerformance(task, doneAt)
       }))
     } finally {
       progressUnsubscribeRef.current?.()
@@ -1966,7 +2175,8 @@ function ExportPage() {
       updateTask(taskId, task => ({
         ...task,
         status: 'paused',
-        controlState: undefined
+        controlState: undefined,
+        performance: finalizeTaskPerformance(task, Date.now())
       }))
       return
     }
@@ -2008,15 +2218,17 @@ function ExportPage() {
     if (!shouldStop) return
 
     if (target.status === 'queued' || target.status === 'paused') {
+      const doneAt = Date.now()
       updateTask(taskId, task => ({
         ...task,
         status: 'stopped',
         controlState: undefined,
-        finishedAt: Date.now(),
+        finishedAt: doneAt,
         progress: {
           ...task.progress,
           phaseLabel: '已停止'
-        }
+        },
+        performance: finalizeTaskPerformance(task, doneAt)
       }))
       return
     }
@@ -2073,7 +2285,10 @@ function ExportPage() {
         contentType: exportDialog.contentType,
         snsOptions
       },
-      progress: createEmptyProgress()
+      progress: createEmptyProgress(),
+      performance: exportDialog.scope === 'content' && exportDialog.contentType === 'text'
+        ? createEmptyTaskPerformance()
+        : undefined
     }
 
     setTasks(prev => [task, ...prev])
@@ -2798,7 +3013,10 @@ function ExportPage() {
       {isTaskCenterOpen && (
         <div
           className="task-center-modal-overlay"
-          onClick={() => setIsTaskCenterOpen(false)}
+          onClick={() => {
+            setIsTaskCenterOpen(false)
+            setExpandedPerfTaskId(null)
+          }}
         >
           <div
             className="task-center-modal"
@@ -2815,7 +3033,10 @@ function ExportPage() {
               <button
                 className="close-icon-btn"
                 type="button"
-                onClick={() => setIsTaskCenterOpen(false)}
+                onClick={() => {
+                  setIsTaskCenterOpen(false)
+                  setExpandedPerfTaskId(null)
+                }}
                 aria-label="关闭任务中心"
               >
                 <X size={16} />
@@ -2826,68 +3047,139 @@ function ExportPage() {
                 <div className="task-empty">暂无任务。点击会话导出或卡片导出后会在这里创建任务。</div>
               ) : (
                 <div className="task-list">
-                  {tasks.map(task => (
-                    <div key={task.id} className={`task-card ${task.status} ${task.controlState ? `request-${task.controlState}` : ''}`}>
-                      <div className="task-main">
-                        <div className="task-title">{task.title}</div>
-                        <div className="task-meta">
-                          <span className={`task-status ${task.status}`}>{getTaskStatusLabel(task)}</span>
-                          <span>{new Date(task.createdAt).toLocaleString('zh-CN')}</span>
+                  {tasks.map(task => {
+                    const canShowPerfDetail = isTextBatchTask(task) && Boolean(task.performance)
+                    const isPerfExpanded = expandedPerfTaskId === task.id
+                    const stageTotals = canShowPerfDetail
+                      ? getTaskPerformanceStageTotals(task.performance, nowTick)
+                      : null
+                    const stageTotalMs = stageTotals
+                      ? stageTotals.collect + stageTotals.build + stageTotals.write + stageTotals.other
+                      : 0
+                    const topSessions = isPerfExpanded
+                      ? getTaskPerformanceTopSessions(task.performance, nowTick, 5)
+                      : []
+                    return (
+                      <div key={task.id} className={`task-card ${task.status} ${task.controlState ? `request-${task.controlState}` : ''}`}>
+                        <div className="task-main">
+                          <div className="task-title">{task.title}</div>
+                          <div className="task-meta">
+                            <span className={`task-status ${task.status}`}>{getTaskStatusLabel(task)}</span>
+                            <span>{new Date(task.createdAt).toLocaleString('zh-CN')}</span>
+                          </div>
+                          {(task.status === 'running' || task.status === 'paused') && (
+                            <>
+                              <div className="task-progress-bar">
+                                <div
+                                  className="task-progress-fill"
+                                  style={{ width: `${task.progress.total > 0 ? (task.progress.current / task.progress.total) * 100 : 0}%` }}
+                                />
+                              </div>
+                              <div className="task-progress-text">
+                                {task.progress.total > 0
+                                  ? `${task.progress.current} / ${task.progress.total}`
+                                  : '处理中'}
+                                {task.progress.phaseLabel ? ` · ${task.progress.phaseLabel}` : ''}
+                              </div>
+                            </>
+                          )}
+                          {canShowPerfDetail && stageTotals && (
+                            <div className="task-perf-summary">
+                              <span>累计耗时 {formatDurationMs(stageTotalMs)}</span>
+                              {task.progress.total > 0 && (
+                                <span>平均/会话 {formatDurationMs(Math.floor(stageTotalMs / Math.max(1, task.progress.total)))}</span>
+                              )}
+                            </div>
+                          )}
+                          {canShowPerfDetail && isPerfExpanded && stageTotals && (
+                            <div className="task-perf-panel">
+                              <div className="task-perf-title">阶段耗时分布</div>
+                              {[
+                                { key: 'collect' as const, label: '收集消息' },
+                                { key: 'build' as const, label: '构建消息' },
+                                { key: 'write' as const, label: '写入文件' },
+                                { key: 'other' as const, label: '其他' }
+                              ].map(item => {
+                                const value = stageTotals[item.key]
+                                const ratio = stageTotalMs > 0 ? Math.min(100, (value / stageTotalMs) * 100) : 0
+                                return (
+                                  <div className="task-perf-row" key={item.key}>
+                                    <div className="task-perf-row-head">
+                                      <span>{item.label}</span>
+                                      <span>{formatDurationMs(value)}</span>
+                                    </div>
+                                    <div className="task-perf-row-track">
+                                      <div className="task-perf-row-fill" style={{ width: `${ratio}%` }} />
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                              <div className="task-perf-title">最慢会话 Top5</div>
+                              {topSessions.length === 0 ? (
+                                <div className="task-perf-empty">暂无会话耗时数据</div>
+                              ) : (
+                                <div className="task-perf-session-list">
+                                  {topSessions.map((session, index) => (
+                                    <div className="task-perf-session-item" key={session.sessionId}>
+                                      <span className="task-perf-session-rank">
+                                        {index + 1}. {session.sessionName || session.sessionId}
+                                        {!session.finishedAt ? '（进行中）' : ''}
+                                      </span>
+                                      <span className="task-perf-session-time">{formatDurationMs(session.liveElapsedMs)}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {task.status === 'error' && <div className="task-error">{task.error || '任务失败'}</div>}
                         </div>
-                        {(task.status === 'running' || task.status === 'paused') && (
-                          <>
-                            <div className="task-progress-bar">
-                              <div
-                                className="task-progress-fill"
-                                style={{ width: `${task.progress.total > 0 ? (task.progress.current / task.progress.total) * 100 : 0}%` }}
-                              />
-                            </div>
-                            <div className="task-progress-text">
-                              {task.progress.total > 0
-                                ? `${task.progress.current} / ${task.progress.total}`
-                                : '处理中'}
-                              {task.progress.phaseLabel ? ` · ${task.progress.phaseLabel}` : ''}
-                            </div>
-                          </>
-                        )}
-                        {task.status === 'error' && <div className="task-error">{task.error || '任务失败'}</div>}
+                        <div className="task-actions">
+                          {canShowPerfDetail && (
+                            <button
+                              className={`task-action-btn ${isPerfExpanded ? 'primary' : ''}`}
+                              type="button"
+                              onClick={() => setExpandedPerfTaskId(prev => (prev === task.id ? null : task.id))}
+                            >
+                              {isPerfExpanded ? '收起详情' : '性能详情'}
+                            </button>
+                          )}
+                          {(task.status === 'running' || task.status === 'queued') && (
+                            <button
+                              className="task-action-btn"
+                              type="button"
+                              onClick={() => void pauseTask(task.id)}
+                              disabled={task.status === 'running' && task.controlState === 'pausing'}
+                            >
+                              {task.status === 'running' && task.controlState === 'pausing' ? '暂停中' : '暂停'}
+                            </button>
+                          )}
+                          {task.status === 'paused' && (
+                            <button
+                              className="task-action-btn primary"
+                              type="button"
+                              onClick={() => resumeTask(task.id)}
+                            >
+                              继续
+                            </button>
+                          )}
+                          {(task.status === 'running' || task.status === 'queued' || task.status === 'paused') && (
+                            <button
+                              className="task-action-btn danger"
+                              type="button"
+                              onClick={() => void stopTask(task.id)}
+                              disabled={task.status === 'running' && task.controlState === 'stopping'}
+                            >
+                              {task.status === 'running' && task.controlState === 'stopping' ? '停止中' : '停止'}
+                            </button>
+                          )}
+                          <button className="task-action-btn" onClick={() => task.payload.outputDir && void window.electronAPI.shell.openPath(task.payload.outputDir)}>
+                            <FolderOpen size={14} /> 目录
+                          </button>
+                        </div>
                       </div>
-                      <div className="task-actions">
-                        {(task.status === 'running' || task.status === 'queued') && (
-                          <button
-                            className="task-action-btn"
-                            type="button"
-                            onClick={() => void pauseTask(task.id)}
-                            disabled={task.status === 'running' && task.controlState === 'pausing'}
-                          >
-                            {task.status === 'running' && task.controlState === 'pausing' ? '暂停中' : '暂停'}
-                          </button>
-                        )}
-                        {task.status === 'paused' && (
-                          <button
-                            className="task-action-btn primary"
-                            type="button"
-                            onClick={() => resumeTask(task.id)}
-                          >
-                            继续
-                          </button>
-                        )}
-                        {(task.status === 'running' || task.status === 'queued' || task.status === 'paused') && (
-                          <button
-                            className="task-action-btn danger"
-                            type="button"
-                            onClick={() => void stopTask(task.id)}
-                            disabled={task.status === 'running' && task.controlState === 'stopping'}
-                          >
-                            {task.status === 'running' && task.controlState === 'stopping' ? '停止中' : '停止'}
-                          </button>
-                        )}
-                        <button className="task-action-btn" onClick={() => task.payload.outputDir && void window.electronAPI.shell.openPath(task.payload.outputDir)}>
-                          <FolderOpen size={14} /> 目录
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

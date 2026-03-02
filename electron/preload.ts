@@ -276,7 +276,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('export:pauseTask', taskId),
     stopTask: (taskId: string) =>
       ipcRenderer.invoke('export:stopTask', taskId),
-    onProgress: (callback: (payload: { current: number; total: number; currentSession: string; phase: string }) => void) => {
+    onProgress: (callback: (payload: { current: number; total: number; currentSession: string; currentSessionId?: string; phase: string }) => void) => {
       ipcRenderer.on('export:progress', (_, payload) => callback(payload))
       return () => ipcRenderer.removeAllListeners('export:progress')
     }

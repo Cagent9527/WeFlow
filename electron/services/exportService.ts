@@ -108,6 +108,7 @@ export interface ExportProgress {
   current: number
   total: number
   currentSession: string
+  currentSessionId?: string
   phase: 'preparing' | 'exporting' | 'exporting-media' | 'exporting-voice' | 'writing' | 'complete'
   phaseProgress?: number
   phaseTotal?: number
@@ -5299,7 +5300,8 @@ class ExportService {
             ...progress,
             current: completedCount,
             total: sessionIds.length,
-            currentSession: sessionInfo.displayName
+            currentSession: sessionInfo.displayName,
+            currentSessionId: sessionId
           })
         }
 
@@ -5411,6 +5413,7 @@ class ExportService {
         current: sessionIds.length,
         total: sessionIds.length,
         currentSession: '',
+        currentSessionId: '',
         phase: 'complete'
       })
 

@@ -827,8 +827,21 @@ class SnsService {
         exportMedia?: boolean
         startTime?: number
         endTime?: number
-    }, progressCallback?: (progress: { current: number; total: number; status: string }) => void): Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; error?: string }> {
+    }, progressCallback?: (progress: { current: number; total: number; status: string }) => void, control?: {
+        shouldPause?: () => boolean
+        shouldStop?: () => boolean
+    }): Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; paused?: boolean; stopped?: boolean; error?: string }> {
         const { outputDir, format, usernames, keyword, exportMedia = false, startTime, endTime } = options
+        const getControlState = (): 'paused' | 'stopped' | null => {
+            if (control?.shouldStop?.()) return 'stopped'
+            if (control?.shouldPause?.()) return 'paused'
+            return null
+        }
+        const buildInterruptedResult = (state: 'paused' | 'stopped', postCount: number, mediaCount: number) => (
+            state === 'stopped'
+                ? { success: true, stopped: true, filePath: '', postCount, mediaCount }
+                : { success: true, paused: true, filePath: '', postCount, mediaCount }
+        )
 
         try {
             // 确保输出目录存在
@@ -845,6 +858,10 @@ class SnsService {
             progressCallback?.({ current: 0, total: 0, status: '正在加载朋友圈数据...' })
 
             while (hasMore) {
+                const controlState = getControlState()
+                if (controlState) {
+                    return buildInterruptedResult(controlState, allPosts.length, 0)
+                }
                 const result = await this.getTimeline(pageSize, 0, usernames, keyword, startTime, endTs)
                 if (result.success && result.timeline && result.timeline.length > 0) {
                     allPosts.push(...result.timeline)
@@ -921,11 +938,18 @@ class SnsService {
                 const queue = [...mediaTasks]
                 const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
                     while (queue.length > 0) {
+                        const controlState = getControlState()
+                        if (controlState) return controlState
                         const task = queue.shift()!
                         await runTask(task)
                     }
+                    return null
                 })
-                await Promise.all(workers)
+                const workerResults = await Promise.all(workers)
+                const interruptedState = workerResults.find(state => state === 'paused' || state === 'stopped')
+                if (interruptedState) {
+                    return buildInterruptedResult(interruptedState, allPosts.length, mediaCount)
+                }
             }
 
             // 2.5 下载头像
@@ -937,6 +961,8 @@ class SnsService {
                 const avatarQueue = [...uniqueUsers]
                 const avatarWorkers = Array.from({ length: Math.min(5, avatarQueue.length) }, async () => {
                     while (avatarQueue.length > 0) {
+                        const controlState = getControlState()
+                        if (controlState) return controlState
                         const post = avatarQueue.shift()!
                         try {
                             const fileName = `avatar_${crypto.createHash('md5').update(post.username).digest('hex').slice(0, 8)}.jpg`
@@ -954,11 +980,20 @@ class SnsService {
                         avatarDone++
                         progressCallback?.({ current: avatarDone, total: uniqueUsers.length, status: `正在下载头像 (${avatarDone}/${uniqueUsers.length})...` })
                     }
+                    return null
                 })
-                await Promise.all(avatarWorkers)
+                const avatarWorkerResults = await Promise.all(avatarWorkers)
+                const interruptedState = avatarWorkerResults.find(state => state === 'paused' || state === 'stopped')
+                if (interruptedState) {
+                    return buildInterruptedResult(interruptedState, allPosts.length, mediaCount)
+                }
             }
 
             // 3. 生成输出文件
+            const finalControlState = getControlState()
+            if (finalControlState) {
+                return buildInterruptedResult(finalControlState, allPosts.length, mediaCount)
+            }
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
             let outputFilePath: string
 

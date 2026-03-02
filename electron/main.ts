@@ -94,6 +94,32 @@ let isDownloadInProgress = false
 let downloadProgressHandler: ((progress: any) => void) | null = null
 let downloadedHandler: (() => void) | null = null
 
+interface ExportTaskControlState {
+  pauseRequested: boolean
+  stopRequested: boolean
+}
+
+const exportTaskControlMap = new Map<string, ExportTaskControlState>()
+
+const getTaskControlState = (taskId?: string): ExportTaskControlState | null => {
+  const normalized = typeof taskId === 'string' ? taskId.trim() : ''
+  if (!normalized) return null
+  return exportTaskControlMap.get(normalized) || null
+}
+
+const createTaskControlState = (taskId?: string): string | null => {
+  const normalized = typeof taskId === 'string' ? taskId.trim() : ''
+  if (!normalized) return null
+  exportTaskControlMap.set(normalized, { pauseRequested: false, stopRequested: false })
+  return normalized
+}
+
+const clearTaskControlState = (taskId?: string): void => {
+  const normalized = typeof taskId === 'string' ? taskId.trim() : ''
+  if (!normalized) return
+  exportTaskControlMap.delete(normalized)
+}
+
 function createWindow(options: { autoShow?: boolean } = {}) {
   // 获取图标路径 - 打包后在 resources 目录
   const { autoShow = true } = options
@@ -1103,11 +1129,27 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('sns:exportTimeline', async (event, options: any) => {
-    return snsService.exportTimeline(options, (progress) => {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send('sns:exportProgress', progress)
-      }
-    })
+    const taskId = typeof options?.taskId === 'string' ? options.taskId : undefined
+    const controlId = createTaskControlState(taskId)
+    const exportOptions = { ...(options || {}) }
+    delete exportOptions.taskId
+
+    try {
+      return snsService.exportTimeline(
+        exportOptions,
+        (progress) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send('sns:exportProgress', progress)
+          }
+        },
+        {
+          shouldPause: () => Boolean(getTaskControlState(controlId || undefined)?.pauseRequested),
+          shouldStop: () => Boolean(getTaskControlState(controlId || undefined)?.stopRequested)
+        }
+      )
+    } finally {
+      clearTaskControlState(controlId || undefined)
+    }
   })
 
   ipcMain.handle('sns:selectExportDir', async () => {
@@ -1230,13 +1272,40 @@ function registerIpcHandlers() {
     return exportService.getExportStats(sessionIds, options)
   })
 
-  ipcMain.handle('export:exportSessions', async (event, sessionIds: string[], outputDir: string, options: ExportOptions) => {
+  ipcMain.handle('export:exportSessions', async (event, sessionIds: string[], outputDir: string, options: ExportOptions, taskId?: string) => {
+    const controlId = createTaskControlState(taskId)
     const onProgress = (progress: ExportProgress) => {
       if (!event.sender.isDestroyed()) {
         event.sender.send('export:progress', progress)
       }
     }
-    return exportService.exportSessions(sessionIds, outputDir, options, onProgress)
+
+    try {
+      return exportService.exportSessions(sessionIds, outputDir, options, onProgress, {
+        shouldPause: () => Boolean(getTaskControlState(controlId || undefined)?.pauseRequested),
+        shouldStop: () => Boolean(getTaskControlState(controlId || undefined)?.stopRequested)
+      })
+    } finally {
+      clearTaskControlState(controlId || undefined)
+    }
+  })
+
+  ipcMain.handle('export:pauseTask', async (_, taskId: string) => {
+    const state = getTaskControlState(taskId)
+    if (!state) {
+      return { success: false, error: '任务未在执行中或已结束' }
+    }
+    state.pauseRequested = true
+    return { success: true }
+  })
+
+  ipcMain.handle('export:stopTask', async (_, taskId: string) => {
+    const state = getTaskControlState(taskId)
+    if (!state) {
+      return { success: false, error: '任务未在执行中或已结束' }
+    }
+    state.stopRequested = true
+    return { success: true }
   })
 
   ipcMain.handle('export:exportSession', async (_, sessionId: string, outputPath: string, options: ExportOptions) => {

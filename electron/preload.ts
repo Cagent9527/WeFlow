@@ -266,12 +266,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   export: {
     getExportStats: (sessionIds: string[], options: any) =>
       ipcRenderer.invoke('export:getExportStats', sessionIds, options),
-    exportSessions: (sessionIds: string[], outputDir: string, options: any) =>
-      ipcRenderer.invoke('export:exportSessions', sessionIds, outputDir, options),
+    exportSessions: (sessionIds: string[], outputDir: string, options: any, taskId?: string) =>
+      ipcRenderer.invoke('export:exportSessions', sessionIds, outputDir, options, taskId),
     exportSession: (sessionId: string, outputPath: string, options: any) =>
       ipcRenderer.invoke('export:exportSession', sessionId, outputPath, options),
     exportContacts: (outputDir: string, options: any) =>
       ipcRenderer.invoke('export:exportContacts', outputDir, options),
+    pauseTask: (taskId: string) =>
+      ipcRenderer.invoke('export:pauseTask', taskId),
+    stopTask: (taskId: string) =>
+      ipcRenderer.invoke('export:stopTask', taskId),
     onProgress: (callback: (payload: { current: number; total: number; currentSession: string; phase: string }) => void) => {
       ipcRenderer.on('export:progress', (_, payload) => callback(payload))
       return () => ipcRenderer.removeAllListeners('export:progress')

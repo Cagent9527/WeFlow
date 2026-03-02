@@ -4776,10 +4776,26 @@ class ExportService {
     sessionIds: string[],
     outputDir: string,
     options: ExportOptions,
-    onProgress?: (progress: ExportProgress) => void
-  ): Promise<{ success: boolean; successCount: number; failCount: number; error?: string }> {
+    onProgress?: (progress: ExportProgress) => void,
+    control?: {
+      shouldPause?: () => boolean
+      shouldStop?: () => boolean
+    }
+  ): Promise<{
+    success: boolean
+    successCount: number
+    failCount: number
+    paused?: boolean
+    stopped?: boolean
+    pendingSessionIds?: string[]
+    successSessionIds?: string[]
+    failedSessionIds?: string[]
+    error?: string
+  }> {
     let successCount = 0
     let failCount = 0
+    const successSessionIds: string[] = []
+    const failedSessionIds: string[] = []
 
     try {
       const conn = await this.ensureConnected()
@@ -4804,11 +4820,13 @@ class ExportService {
       const sessionConcurrency = (exportMediaEnabled && sessionLayout === 'shared')
         ? 1
         : clampedConcurrency
+      const queue = [...sessionIds]
+      let pauseRequested = false
+      let stopRequested = false
 
-      await parallelLimit(sessionIds, sessionConcurrency, async (sessionId) => {
+      const runOne = async (sessionId: string) => {
         const sessionInfo = await this.getContactInfo(sessionId)
 
-        // 创建包装后的进度回调，自动附加会话级信息
         const sessionProgress = (progress: ExportProgress) => {
           onProgress?.({
             ...progress,
@@ -4864,8 +4882,10 @@ class ExportService {
 
         if (result.success) {
           successCount++
+          successSessionIds.push(sessionId)
         } else {
           failCount++
+          failedSessionIds.push(sessionId)
           console.error(`导出 ${sessionId} 失败:`, result.error)
         }
 
@@ -4876,7 +4896,49 @@ class ExportService {
           currentSession: sessionInfo.displayName,
           phase: 'exporting'
         })
+      }
+
+      const workers = Array.from({ length: Math.min(sessionConcurrency, queue.length) }, async () => {
+        while (queue.length > 0) {
+          if (control?.shouldStop?.()) {
+            stopRequested = true
+            break
+          }
+          if (control?.shouldPause?.()) {
+            pauseRequested = true
+            break
+          }
+
+          const sessionId = queue.shift()
+          if (!sessionId) break
+          await runOne(sessionId)
+        }
       })
+      await Promise.all(workers)
+
+      const pendingSessionIds = [...queue]
+      if (stopRequested && pendingSessionIds.length > 0) {
+        return {
+          success: true,
+          successCount,
+          failCount,
+          stopped: true,
+          pendingSessionIds,
+          successSessionIds,
+          failedSessionIds
+        }
+      }
+      if (pauseRequested && pendingSessionIds.length > 0) {
+        return {
+          success: true,
+          successCount,
+          failCount,
+          paused: true,
+          pendingSessionIds,
+          successSessionIds,
+          failedSessionIds
+        }
+      }
 
       onProgress?.({
         current: sessionIds.length,
@@ -4885,7 +4947,7 @@ class ExportService {
         phase: 'complete'
       })
 
-      return { success: true, successCount, failCount }
+      return { success: true, successCount, failCount, successSessionIds, failedSessionIds }
     } catch (e) {
       return { success: false, successCount, failCount, error: String(e) }
     }

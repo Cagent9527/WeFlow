@@ -63,6 +63,8 @@ interface GroupMemberContactInfo {
 class GroupAnalyticsService {
   private configService: ConfigService
   private readonly groupMembersPanelCacheTtlMs = 10 * 60 * 1000
+  private readonly groupMembersPanelMembersTimeoutMs = 12 * 1000
+  private readonly groupMembersPanelFullTimeoutMs = 25 * 1000
   private readonly groupMembersPanelCache = new Map<string, { updatedAt: number; data: GroupMembersPanelEntry[] }>()
   private readonly groupMembersPanelInFlight = new Map<
     string,
@@ -482,6 +484,31 @@ class GroupAnalyticsService {
     const removeCount = this.groupMembersPanelCache.size - maxEntries
     for (let i = 0; i < removeCount; i += 1) {
       this.groupMembersPanelCache.delete(entries[i][0])
+    }
+  }
+
+  private async withPromiseTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    timeoutResult: T
+  ): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return promise
+    }
+
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null
+    const timeoutPromise = new Promise<T>((resolve) => {
+      timeoutTimer = setTimeout(() => {
+        resolve(timeoutResult)
+      }, timeoutMs)
+    })
+
+    try {
+      return await Promise.race([promise, timeoutPromise])
+    } finally {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer)
+      }
     }
   }
 
@@ -911,7 +938,19 @@ class GroupAnalyticsService {
         const conn = await this.ensureConnected()
         if (!conn.success) return { success: false, error: conn.error }
 
-        const fresh = await this.loadGroupMembersPanelDataFresh(normalizedChatroomId, includeMessageCounts)
+        const timeoutMs = includeMessageCounts
+          ? this.groupMembersPanelFullTimeoutMs
+          : this.groupMembersPanelMembersTimeoutMs
+        const fresh = await this.withPromiseTimeout(
+          this.loadGroupMembersPanelDataFresh(normalizedChatroomId, includeMessageCounts),
+          timeoutMs,
+          {
+            success: false,
+            error: includeMessageCounts
+              ? '群成员发言统计加载超时，请稍后重试'
+              : '群成员列表加载超时，请稍后重试'
+          }
+        )
         if (!fresh.success || !fresh.data) {
           return { success: false, error: fresh.error || '获取群成员面板数据失败' }
         }

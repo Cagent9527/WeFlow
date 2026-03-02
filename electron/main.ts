@@ -1425,7 +1425,6 @@ function registerIpcHandlers() {
       return groupAnalyticsService.getGroupMembersPanelData(chatroomId, normalizedOptions)
     }
   )
-  })
 
   ipcMain.handle('groupAnalytics:getGroupMessageRanking', async (_, chatroomId: string, limit?: number, startTime?: number, endTime?: number) => {
     return groupAnalyticsService.getGroupMessageRanking(chatroomId, limit, startTime, endTime)

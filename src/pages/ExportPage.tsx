@@ -5236,6 +5236,7 @@ function ExportPage() {
   const renderContactRow = useCallback((_: number, contact: ContactInfo) => {
     const matchedSession = sessionRowByUsername.get(contact.username)
     const canExport = Boolean(matchedSession?.hasSession)
+    const isSessionBindingPending = !matchedSession && (isLoading || isSessionEnriching)
     const checked = canExport && selectedSessions.has(contact.username)
     const isRunning = canExport && runningSessionIds.has(contact.username)
     const isQueued = canExport && queuedSessionIds.has(contact.username)
@@ -5246,14 +5247,17 @@ function ExportPage() {
     const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
     const displayedMessageCount = countedMessages ?? hintedMessages
     const mediaMetric = sessionContentMetrics[contact.username]
-    const messageCountLabel = !canExport
-      ? '--'
-      : typeof displayedMessageCount === 'number'
-        ? displayedMessageCount.toLocaleString('zh-CN')
-        : '获取中'
+    const messageCountState: { state: 'value'; text: string } | { state: 'loading' } | { state: 'na'; text: '--' } =
+      !canExport
+        ? (isSessionBindingPending ? { state: 'loading' } : { state: 'na', text: '--' })
+        : typeof displayedMessageCount === 'number'
+          ? { state: 'value', text: displayedMessageCount.toLocaleString('zh-CN') }
+          : { state: 'loading' }
     const metricToDisplay = (value: unknown): { state: 'value'; text: string } | { state: 'loading' } | { state: 'na'; text: '--' } => {
       const normalized = normalizeMessageCount(value)
-      if (!canExport) return { state: 'na', text: '--' }
+      if (!canExport) {
+        return isSessionBindingPending ? { state: 'loading' } : { state: 'na', text: '--' }
+      }
       if (typeof normalized === 'number') {
         return { state: 'value', text: normalized.toLocaleString('zh-CN') }
       }
@@ -5310,8 +5314,10 @@ function ExportPage() {
           </div>
           <div className="row-message-count">
             <div className="row-message-stats">
-              <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
-                {messageCountLabel}
+              <strong className={`row-message-count-value ${messageCountState.state === 'value' ? '' : 'muted'}`}>
+                {messageCountState.state === 'loading'
+                  ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                  : messageCountState.text}
               </strong>
             </div>
             {canExport && (
@@ -5424,6 +5430,8 @@ function ExportPage() {
     sessionLoadTraceMap,
     sessionMessageCounts,
     sessionRowByUsername,
+    isLoading,
+    isSessionEnriching,
     showSessionDetailPanel,
     shouldShowSnsColumn,
     snsUserPostCounts,

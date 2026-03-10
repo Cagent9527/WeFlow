@@ -2032,7 +2032,7 @@
   .contacts-virtuoso {
     height: 100%;
     width: 100%;
-    overflow-x: hidden !important;
+    overflow-x: clip !important;
     overflow-y: auto !important;
 
     &::-webkit-scrollbar {

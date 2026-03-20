@@ -1,10 +1,9 @@
 import { app } from 'electron'
 import { join } from 'path'
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
-import { execFile, exec } from 'child_process'
+import { execFile, exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { createRequire } from 'module';
-import { spawn } from 'child_process'
 const require = createRequire(import.meta.url);
 
 const execFileAsync = promisify(execFile)
